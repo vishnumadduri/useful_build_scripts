@@ -60,17 +60,16 @@ EOF
 # ---------------------------------------------------------------------------
 
 echo_latest_version() {
+  # Capture wget output into a variable first so that a wget failure is
+  # detectable (pipelines swallow intermediate exit codes in POSIX sh).
   if [ "${EDGE-}" ]; then
     # Get the most recent release tag (including pre-releases) from the list.
-    version="$(wget -qO- 'https://api.github.com/repos/coder/code-server/releases' \
-      | grep '"tag_name"' \
-      | head -n 1 \
-      | awk -F '"' '{print $4}')"
+    response="$(wget -qO- 'https://api.github.com/repos/coder/code-server/releases')"
+    version="$(echo "$response" | grep '"tag_name"' | head -n 1 | awk -F '"' '{print $4}')"
   else
     # Use the /releases/latest endpoint which returns only stable releases.
-    version="$(wget -qO- 'https://api.github.com/repos/coder/code-server/releases/latest' \
-      | grep '"tag_name"' \
-      | awk -F '"' '{print $4}')"
+    response="$(wget -qO- 'https://api.github.com/repos/coder/code-server/releases/latest')"
+    version="$(echo "$response" | grep '"tag_name"' | awk -F '"' '{print $4}')"
   fi
   # Strip leading 'v' if present.
   version="${version#v}"
@@ -261,7 +260,7 @@ parse_arg() {
     *=*)
       opt="${1%%=*}"
       optarg="${1#*=}"
-      if [ ! "$optarg" ] && [ ! "${OPTIONAL-}" ]; then
+      if [ -z "$optarg" ] && [ ! "${OPTIONAL-}" ]; then
         echoerr "$opt requires an argument"
         echoerr "Run with --help to see usage."
         exit 1
@@ -300,9 +299,13 @@ fetch() {
   fi
 
   sh_c mkdir -p "$CACHE_DIR"
-  # -O: write to file; incomplete download gets a temporary suffix so a partial
-  # file is never mistaken for a complete one.
-  sh_c wget -O '"'"$FILE.incomplete"'"' '"'"$URL"'"'
+  # Download to a temporary name; on failure remove the incomplete file so that
+  # a subsequent run does not reuse a partial download.
+  if ! sh_c wget -O '"'"$FILE.incomplete"'"' '"'"$URL"'"'; then
+    sh_c rm -f '"'"$FILE.incomplete"'"'
+    echoerr "Download failed: $URL"
+    exit 1
+  fi
   sh_c mv '"'"$FILE.incomplete"'"' '"'"$FILE"'"'
 }
 
@@ -387,7 +390,7 @@ arch() {
 # ---------------------------------------------------------------------------
 
 command_exists() {
-  if [ ! "$1" ]; then return 1; fi
+  if [ -z "$1" ]; then return 1; fi
   command -v "$@" > /dev/null 2>&1
 }
 
@@ -423,9 +426,12 @@ echoerr() {
   echoh "$@" >&2
 }
 
+# Replace the literal $HOME path with '~' for readability.
+# Escapes regex metacharacters in $HOME (e.g. dots) before passing to sed.
 humanpath() {
   if [ "${HOME-}" ]; then
-    sed "s# $HOME# ~#g"
+    home_escaped="$(echo "$HOME" | sed 's/[.[\*^$]/\\&/g')"
+    sed "s# $home_escaped# ~#g"
   else
     cat
   fi
