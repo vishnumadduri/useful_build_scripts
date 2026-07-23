@@ -1,0 +1,42 @@
+FROM ros:rolling-ros-base
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git wget gnupg2 lsb-release ca-certificates \
+    python3-pip python3-rosdep python3-vcstool python3-colcon-common-extensions \
+    build-essential cmake pkg-config \
+    libasio-dev libtinyxml2-dev libeigen3-dev \
+    tmux just \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rosdep init || true && rosdep update
+
+WORKDIR /workspace
+RUN mkdir -p /workspace/src
+
+# ROS 2 source
+RUN vcs import --input https://raw.githubusercontent.com/ros2/ros2/rolling/ros2.repos /workspace/src
+
+# iceoryx2 source
+RUN vcs import --force --input https://raw.githubusercontent.com/ekxide/rmw_iceoryx2/refs/heads/rolling/iceoryx.repos /workspace/src
+
+# rmw_iceoryx2 source
+RUN git clone -b rolling https://github.com/ekxide/rmw_iceoryx2.git /workspace/src/rmw_iceoryx2
+
+# Install dependencies
+RUN apt-get update && \
+    source /opt/ros/rolling/setup.bash && \
+    rosdep install --from-paths /workspace/src --ignore-src -r -y \
+      --skip-keys "fastcdr rti-connext-dds-7.7.0 urdfdom_headers" && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build
+RUN source /opt/ros/rolling/setup.bash && \
+    cd /workspace && \
+    RMW_IMPLEMENTATION=rmw_iceoryx2_cxx colcon build --symlink-install \
+      --packages-up-to ros2cli_common_extensions rmw_iceoryx2_cxx rmw_iceoryx2_talker_demo_nodes
+
+CMD ["/bin/bash"]
