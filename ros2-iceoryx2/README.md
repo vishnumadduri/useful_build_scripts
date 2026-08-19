@@ -44,9 +44,9 @@ size; useful for local development where you don't care about final image size.
    ```bash
    docker build -t ros-iceoryx2:full -f Dockerfile .
    ```
-3. Run it:
+3. Run it (talker + listener in the same container — see [Run](#run) below for why):
    ```bash
-   docker run -it --rm ros-iceoryx2:full
+   docker run -it --rm --name ros-iceoryx2-demo ros-iceoryx2:full
    source /workspace/install/setup.bash
    ros2 run rmw_iceoryx2_talker_demo_nodes talker_strings
    ```
@@ -55,10 +55,44 @@ To rebuild from scratch (ignore Docker's layer cache), add `--no-cache` to step 
 
 ## Run
 
+iceoryx2 is a shared-memory transport: talker and listener rendezvous through `/dev/shm` and a
+Unix domain socket, so **both nodes must run in the same container** (same IPC namespace and
+`/dev/shm`) — two separate `docker run` invocations are two separate containers with isolated
+`/dev/shm` by default and will never see each other, even on the same host and image. Either open
+a second terminal into the *same* running container with `docker exec`, or run one node in the
+background of a single container.
+
+**Terminal 1 — start the container and the listener:**
 ```bash
-docker run -it --rm ros-iceoryx2
+docker run -it --rm --name ros-iceoryx2-demo ros-iceoryx2
 source /workspace/install/setup.bash
-ros2 run rmw_iceoryx2_talker_demo_nodes talker_strings
+ros2 run rmw_iceoryx2_talker_demo_nodes listener_strings
+```
+
+**Terminal 2 — attach to the same container and start the talker:**
+```bash
+docker exec -it ros-iceoryx2-demo bash -lc \
+  "source /workspace/install/setup.bash && ros2 run rmw_iceoryx2_talker_demo_nodes talker_strings"
+```
+
+If you do need talker and listener in separate containers (e.g. separate services in
+docker-compose), share the IPC namespace explicitly — e.g. run the second container with
+`--ipc=container:ros-iceoryx2-demo` (or give both containers `--ipc=host` to share the host's
+`/dev/shm`).
+
+**Verified working** — talker output:
+```
+[INFO] [talker_strings]:
+╭─ SENT
+│  string_value  Hello 0
+╰────────────────────────────
+```
+listener output:
+```
+[INFO] [listener_strings]:
+╭─ RECV · seq 0
+│  string_value  Hello 0
+╰────────────────────────────
 ```
 
 ## Notes
@@ -69,3 +103,9 @@ ros2 run rmw_iceoryx2_talker_demo_nodes talker_strings
   [OSRF's official ROS 2 source Dockerfile](https://github.com/osrf/docker_images/blob/master/ros2/source/source/Dockerfile).
 - `RMW_IMPLEMENTATION=rmw_iceoryx2_cxx` selects the iceoryx2 middleware at build time for the demo
   nodes target; set the same env var at runtime to use it when running ROS 2 nodes.
+- Both nodes print `rcutils_set_error_state()` / "failed to resolve symbol ..." warnings and
+  `Failed to add event handler for incompatible qos/type; not supported` on startup. These are
+  harmless — `rmw_iceoryx2_cxx` doesn't implement the optional service/client-introspection and
+  QoS-event-handler symbols that `rmw_implementation` probes for, but pub/sub (what these demo
+  nodes use) is unaffected. Confirmed by running the two-stage build end-to-end: `talker_strings`
+  and `listener_strings` in the same container exchange messages correctly despite the warnings.
