@@ -51,6 +51,7 @@ param(
     [switch]$SkipGitInstall,
     [switch]$SkipPythonInstall,
     [switch]$SkipRepoClone,
+    [switch]$SkipWindowsPatch,
     [switch]$SkipVenv,
     [switch]$SkipTorchInstall,
     [switch]$SkipRequirements,
@@ -202,6 +203,46 @@ if (-not (Test-Path $InstallDir)) {
 }
 
 # ---------------------------------------------------------------------------
+# Two small upstream fixes needed on Windows regardless of GPU vendor:
+#   - api_server.py hardcodes its model subfolder with no CLI override, so it
+#     can't load anything but the mini-turbo variant.
+#   - hy3dgen/rembg.py lets rembg auto-pick its onnxruntime execution
+#     provider, which only checks for CUDA/ROCm/OpenVINO and falls back to
+#     CPU - there's no Windows ROCm onnxruntime build, so this silently runs
+#     on CPU/system RAM even with a capable GPU sitting idle. Route it
+#     through DirectML instead (works on any DX12 GPU: NVIDIA/AMD/Intel).
+if (-not $SkipWindowsPatch) {
+    Write-Step "Applying Windows fixes (subfolder CLI arg, rembg via DirectML)"
+    $patchFile = Join-Path $PSScriptRoot "windows-fixes.patch"
+    Push-Location $InstallDir
+    try {
+        # No stderr redirect at all on these git apply --check calls (not
+        # even to $null): under $ErrorActionPreference = "Stop", ANY
+        # redirection of a failing native command's stderr - 2>$null, *>$null,
+        # 2>&1 - turns it into a terminating NativeCommandError instead of
+        # just a non-zero $LASTEXITCODE (same class of bug fixed earlier for
+        # py.exe/winget above). Piping stdout to Out-Null is fine; git's
+        # error text (if any) prints to the console, which is harmless here.
+        git apply --check $patchFile | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            git apply $patchFile
+            Write-Host "    Applied $patchFile"
+        } else {
+            git apply --reverse --check $patchFile | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "    Already applied, skipping."
+            } else {
+                Write-Warn2 "Patch didn't apply cleanly (upstream file may have changed) - apply it manually or diff by hand: $patchFile"
+            }
+        }
+    } finally {
+        Pop-Location
+    }
+} else {
+    Write-Host "`n==> Skipping Windows fixes patch (-SkipWindowsPatch)" -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------
 if (-not $SkipVenv) {
     Write-Step "Creating Python venv"
     if (Test-Path $VenvPython) {
@@ -282,6 +323,15 @@ if (-not $SkipRequirements) {
     # "ValueError: tiktoken is required to read a tiktoken file" the moment
     # that flag is used. Installing it always so the flag works out of the box.
     & $VenvPython -m pip install sentencepiece | Out-Null
+
+    # requirements.txt pulls in plain `onnxruntime`, which is CPU-only on
+    # Windows (no CUDA/ROCm execution provider bundled). Swap it for
+    # onnxruntime-directml so rembg (background removal) actually uses the
+    # GPU via DirectML - works on any DX12 GPU (NVIDIA/AMD/Intel), unlike
+    # ROCm/CUDA-specific onnxruntime builds. Paired with the
+    # DmlExecutionProvider change in windows-fixes.patch above.
+    & $VenvPython -m pip uninstall onnxruntime -y | Out-Null
+    & $VenvPython -m pip install onnxruntime-directml | Out-Null
 } else {
     Write-Host "`n==> Skipping requirements install (-SkipRequirements)" -ForegroundColor Cyan
 }

@@ -21,6 +21,7 @@ below.
 | `setup_hunyuan3d2_env.ps1` | Clone the repo, set up the venv/PyTorch/deps, build extensions, download weights |
 | `setup_hunyuan3d2_env.bat` | Double-clickable wrapper that runs the .ps1 with the execution policy bypassed |
 | `setup_hunyuan3d2_env_amd.bat` | Same, but forces `-GpuVendor Amd` - no arguments needed for AMD GPUs |
+| `windows-fixes.patch` | Two small upstream bug fixes applied automatically after cloning - see [Windows fixes patch](#windows-fixes-patch) |
 
 ---
 
@@ -57,6 +58,7 @@ UAC):
 | `-SkipGitInstall` | off | Skip installing Git |
 | `-SkipPythonInstall` | off | Skip installing Python |
 | `-SkipRepoClone` | off | Skip cloning/updating the repo |
+| `-SkipWindowsPatch` | off | Skip applying `windows-fixes.patch` - see [Windows fixes patch](#windows-fixes-patch) |
 | `-SkipVenv` | off | Skip creating the venv |
 | `-SkipTorchInstall` | off | Skip installing PyTorch |
 | `-SkipRequirements` | off | Skip `pip install -r requirements.txt` / `pip install -e .` |
@@ -69,8 +71,11 @@ UAC):
    if not already present: 3.11 normally, or 3.12 specifically on the AMD
    path (AMD's ROCm wheels are `cp312`-only).
 2. Clones `Tencent-Hunyuan/Hunyuan3D-2` into `-InstallDir` (skips if already cloned).
-3. Creates a venv at `<InstallDir>\venv` (via `py -3.12` on the AMD path).
-4. Installs **PyTorch**, auto-detecting the GPU vendor (NVIDIA via
+3. Applies `windows-fixes.patch` (see [below](#windows-fixes-patch)) - detects
+   and skips cleanly if already applied, warns (doesn't fail the run) if it
+   no longer applies because upstream changed.
+5. Creates a venv at `<InstallDir>\venv` (via `py -3.12` on the AMD path).
+6. Installs **PyTorch**, auto-detecting the GPU vendor (NVIDIA via
    `nvidia-smi`/WMI, then AMD via WMI, else CPU) unless `-GpuVendor` forces one:
    - **NVIDIA** -> CUDA wheel from the official PyTorch index (`cu124` by default).
    - **AMD** -> AMD's official Windows ROCm preview wheels from
@@ -79,10 +84,16 @@ UAC):
      touch GPU drivers.
    - **Neither found** -> CPU-only wheel (works, but shape/texture generation
      will be very slow - the project normally expects 6-16 GB of VRAM).
-5. Installs `requirements.txt` and the package itself (`pip install -e .`),
-   plus `sentencepiece` - `requirements.txt` leaves it commented out, but
-   without it `gradio_app.py --enable_t23d` (text-to-3D) fails at startup.
-6. **Best-effort** builds `custom_rasterizer` and `differentiable_renderer`
+7. Installs `requirements.txt` and the package itself (`pip install -e .`),
+   plus:
+   - `sentencepiece` - `requirements.txt` leaves it commented out, but
+     without it `gradio_app.py --enable_t23d` (text-to-3D) fails at startup.
+   - Swaps `onnxruntime` (installed by `requirements.txt`, CPU-only on
+     Windows) for **`onnxruntime-directml`**, so `rembg` (background
+     removal, used by every generation) runs on the GPU via DirectML instead
+     of system RAM. Paired with the `DmlExecutionProvider` change in
+     `windows-fixes.patch`.
+8. **Best-effort** builds `custom_rasterizer` and `differentiable_renderer`
    (`hy3dgen/texgen/*`), the CUDA-only C++ extensions texture generation
    needs. On the **NVIDIA** path this requires `cl.exe` (MSVC) and `nvcc`
    (CUDA Toolkit matching the installed PyTorch build) on `PATH` - the script
@@ -91,7 +102,7 @@ UAC):
    **AMD** path the build is **always skipped** - these extensions have no
    HIP/ROCm port upstream, so they cannot build against an AMD GPU regardless
    of what's installed. Shape generation works fine on both paths without them.
-7. Pre-downloads the selected model repo's weights via
+9. Pre-downloads the selected model repo's weights via
    `huggingface_hub.snapshot_download`, so the first `from_pretrained(...)`
    call in your own code doesn't block on a multi-GB download. Caches to
    `%USERPROFILE%\.cache\huggingface` by default, or `-ModelCacheDir` if set.
@@ -115,6 +126,44 @@ that step manually and re-run with the earlier steps skipped.
 | `tencent/Hunyuan3D-2mini` | 0.6B | Smaller/faster, lower VRAM |
 | `tencent/Hunyuan3D-2mv` | 1.1B | Multiview-conditioned shape generation |
 | `tencent/Hunyuan3D-2.1` | - | Newer major version |
+
+### Windows fixes patch
+
+`windows-fixes.patch` fixes two bugs found running this project on Windows
+(not AMD-specific - both apply on NVIDIA too). Applied automatically after
+cloning (step 3 above); pass `-SkipWindowsPatch` to skip it, or apply/inspect
+it by hand:
+```powershell
+cd "<InstallDir>"
+git apply "<path to>\windows-fixes.patch"
+```
+
+1. **`api_server.py`'s model subfolder has no CLI override.** It's
+   hardcoded to `hunyuan3d-dit-v2-mini-turbo` (the `tencent/Hunyuan3D-2mini`
+   layout), so passing `--model_path tencent/Hunyuan3D-2` (or `-2mv`/`-2.1`)
+   fails to find that subfolder in the downloaded snapshot. The patch adds a
+   `--subfolder` flag, mirroring the one `gradio_app.py` already has:
+   ```powershell
+   .\venv\Scripts\python.exe api_server.py --model_path tencent/Hunyuan3D-2 --subfolder hunyuan3d-dit-v2-0 --device cuda
+   ```
+2. **`rembg` (background removal, used on every generation) silently runs
+   on CPU.** `hy3dgen/rembg.py` lets `rembg` auto-pick its `onnxruntime`
+   execution provider, which only checks for CUDA/ROCm/OpenVINO and falls
+   back to CPU - and there's no Windows ROCm `onnxruntime` build, so on AMD
+   (and on NVIDIA too, unless you separately install `onnxruntime-gpu`) this
+   quietly burns system RAM instead of GPU VRAM for a step that runs on
+   every single generation. Under memory pressure (e.g. several
+   Hunyuan3D-2 processes running at once) it fails outright:
+   `onnxruntime.capi.onnxruntime_pybind11_state.Fail: ... Failed to allocate
+   memory for requested buffer`. The patch makes it explicitly request
+   `DmlExecutionProvider` (DirectML - works on any DX12 GPU: NVIDIA/AMD/Intel),
+   paired with the setup script swapping in `onnxruntime-directml` (step 7).
+
+The patch is idempotent - re-running the setup script detects if it's
+already applied (via `git apply --reverse --check`) and skips cleanly rather
+than erroring. If upstream changes these files enough that the patch stops
+applying, the script warns and continues rather than failing the whole run;
+apply the equivalent change by hand in that case.
 
 ### AMD/ROCm (R9700, etc.)
 
