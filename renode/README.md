@@ -18,7 +18,7 @@ Scripts to build Zephyr LVGL demos for STM32F746G-DISCO and simulate them in Ren
 # 1. Build Renode (once)
 ./install_renode.sh
 
-# 2. Build Zephyr + LVGL firmware (once per demo)
+# 2. Build Zephyr + LVGL firmware (defaults to native 480x272)
 ./setup_zephyr_lvgl.sh
 
 # 3. Simulate
@@ -30,14 +30,15 @@ Scripts to build Zephyr LVGL demos for STM32F746G-DISCO and simulate them in Ren
 ## setup_zephyr_lvgl.sh
 
 ```
-./setup_zephyr_lvgl.sh [WORKDIR] [BOARD] [DEMO]
+./setup_zephyr_lvgl.sh [WORKDIR] [BOARD] [DEMO] [RESOLUTION]
 ```
 
 | Argument | Default | Description |
 |---|---|---|
 | `WORKDIR` | `~/zephyr-renode` | Zephyr west workspace root |
-| `BOARD` | `stm32f746g_disco` | Zephyr board target |
+| `BOARD` | `stm32f746g_disco` | Zephyr board target (the only supported board) |
 | `DEMO` | `hello_world` | LVGL demo to build (see table below) |
+| `RESOLUTION` | `480x272` | Display preset: native `480x272` or optional `800x400` |
 
 ### Available demos
 
@@ -59,21 +60,23 @@ Scripts to build Zephyr LVGL demos for STM32F746G-DISCO and simulate them in Ren
 4. Installs Python requirements into a venv
 5. Builds the selected LVGL demo with ccache acceleration
 
-Each demo gets its own build directory: `build_<BOARD>_<DEMO>/`
+Each demo and resolution gets its own build directory:
+`build_<BOARD>_<DEMO>_<RESOLUTION>/`. This allows both resolutions to remain
+built at the same time.
 
 **Logs:** `~/zephyr-build.log`
 
 ### Examples
 
 ```bash
-# Default: hello_world on stm32f746g_disco
+# Default: hello_world on stm32f746g_disco at native 480x272
 ./setup_zephyr_lvgl.sh
 
-# Music player demo
-./setup_zephyr_lvgl.sh ~/zephyr-renode stm32f746g_disco music
+# Optional 800x400 display
+./setup_zephyr_lvgl.sh ~/zephyr-renode stm32f746g_disco music 800x400
 
-# Widgets showcase
-./setup_zephyr_lvgl.sh ~/zephyr-renode stm32f746g_disco widgets
+# Explicit native Discovery display resolution
+./setup_zephyr_lvgl.sh ~/zephyr-renode stm32f746g_disco hello_world 480x272
 ```
 
 ---
@@ -120,7 +123,7 @@ Each demo gets its own build directory: `build_<BOARD>_<DEMO>/`
 ## run_renode_lvgl.sh
 
 ```
-./run_renode_lvgl.sh [WORKDIR] [BOARD] [DEMO]
+./run_renode_lvgl.sh [WORKDIR] [BOARD] [DEMO] [RESOLUTION]
 ```
 
 Arguments must match what was passed to `setup_zephyr_lvgl.sh`.
@@ -128,27 +131,31 @@ Arguments must match what was passed to `setup_zephyr_lvgl.sh`.
 | Argument | Default | Description |
 |---|---|---|
 | `WORKDIR` | `~/zephyr-renode` | Same workspace used during build |
-| `BOARD` | `stm32f746g_disco` | Same board used during build |
+| `BOARD` | `stm32f746g_disco` | Same board used during build; only `stm32f746g_disco` is supported |
 | `DEMO` | `hello_world` | Same demo built by setup script |
+| `RESOLUTION` | `480x272` | Must match the resolution used during setup |
 
 ### What it does
 
 1. Locates the Renode binary (`~/renode/renode`, `~/.local/bin/renode`, or `$PATH`)
 2. Detects WSLg and sets display flags accordingly
 3. Verifies the ELF artifact exists — prints a hint if not
-4. Generates (or refreshes) `run_<BOARD>_<DEMO>.resc` when the ELF is newer than the script
+4. Generates (or refreshes) `run_<BOARD>_<DEMO>_<RESOLUTION>.resc`
 5. Launches Renode with two analyzer windows:
    - **USART1** — Zephyr shell (`uart:~$`)
-   - **LTDC PixelViewer** — LVGL display output (480×272)
+   - **LTDC PixelViewer** — LVGL output at the selected resolution
 
 ### Examples
 
 ```bash
-# Simulate the default hello_world build
+# Simulate the default 480x272 hello_world build
 ./run_renode_lvgl.sh
 
-# Simulate the music demo
-./run_renode_lvgl.sh ~/zephyr-renode stm32f746g_disco music
+# Simulate the 800x400 music demo
+./run_renode_lvgl.sh ~/zephyr-renode stm32f746g_disco music 800x400
+
+# Simulate a previously built native-resolution demo
+./run_renode_lvgl.sh ~/zephyr-renode stm32f746g_disco hello_world 480x272
 ```
 
 ---
@@ -157,10 +164,30 @@ Arguments must match what was passed to `setup_zephyr_lvgl.sh`.
 
 ### STM32F746G-DISCO
 
-- **Renode platform:** `platforms/boards/stm32f7_discovery-bb.repl`
-- **Display:** 480×272 LCD via LTDC (`sysbus.ltdc`)
 - **Serial:** `sysbus.usart1`
 - **Zephyr board name:** `stm32f746g_disco`
+
+| Resolution | Zephyr configuration | Renode platform |
+|---|---|---|
+| `480x272` (default) | Native board device tree | `platforms/boards/stm32f7_discovery-bb.repl` |
+| `800x400` (optional) | `renode/boards/stm32f746g_disco_800x400.overlay` | `renode/boards/stm32f746g_disco_800x400.repl` |
+
+For `800x400`, the overlay changes the dimensions Zephyr uses for LVGL and
+programs into the LTDC peripheral. Renode reads those LTDC timing registers
+and resizes PixelViewer accordingly; the companion REPL keeps FT5336 touch
+coordinates aligned with the framebuffer. The `480x272` preset uses the
+upstream STM32F746G-DISCO definitions unchanged.
+
+### Checking the active resolution
+
+Renode opens analyzer windows at a fixed 800×600 window size. PixelViewer also
+defaults to **Fit**, so both the 480×272 and 800×400 framebuffers are scaled to
+fit a similarly sized window. The window size is not the emulated LCD size.
+
+Check the **Resolution** field at the bottom of PixelViewer to see the actual
+framebuffer dimensions. Select **Center** in the **Display mode** menu to show
+the framebuffer without scaling. The launcher also prints the selected
+resolution, firmware path, and platform before Renode starts.
 
 ### WSLg
 

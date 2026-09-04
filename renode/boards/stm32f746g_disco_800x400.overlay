@@ -1,0 +1,26 @@
+/*
+ * Replace the STM32F746G-DISCO's on-board 480x272 panel with an 800x400
+ * panel. Renode derives the PixelViewer framebuffer dimensions from the
+ * LTDC registers programmed by Zephyr, so these values control both LVGL's
+ * logical resolution and the emulated display size.
+ */
+
+&ltdc {
+	width = <800>;
+	height = <400>;
+
+	display-timings {
+		/* Timing values only delimit the active area in Renode. */
+		hsync-len = <1>;
+		vsync-len = <10>;
+		hback-porch = <43>;
+		vback-porch = <12>;
+		hfront-porch = <8>;
+		vfront-porch = <4>;
+	};
+};
+
+&ft5336 {
+	screen-width = <800>;
+	screen-height = <400>;
+};
