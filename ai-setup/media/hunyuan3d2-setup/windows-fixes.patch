@@ -1,0 +1,128 @@
+diff --git a/api_server.py b/api_server.py
+index dd2895b..ef3c4b3 100644
+--- a/api_server.py
++++ b/api_server.py
+@@ -28,6 +28,15 @@ import traceback
+ import uuid
+ from io import BytesIO
+ 
++# Must be set before torch loads. Without this, the multiview texture
++# diffusion step can hit "HIP/CUDA out of memory" well before VRAM is
++# actually full - allocator fragmentation, not a real capacity limit. Safe
++# on every backend: PYTORCH_ALLOC_CONF is CUDA's current name,
++# PYTORCH_HIP_ALLOC_CONF is what ROCm torch 2.x still reads; unused ones are
++# no-ops. Verified end-to-end on an AMD Radeon AI PRO R9700 (ROCm 7.2.1).
++os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
++os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
++
+ import torch
+ import trimesh
+ import uvicorn
+@@ -149,7 +158,8 @@ class ModelWorker:
+                  tex_model_path='tencent/Hunyuan3D-2',
+                  subfolder='hunyuan3d-dit-v2-mini-turbo',
+                  device='cuda',
+-                 enable_tex=False):
++                 enable_tex=False,
++                 enable_t23d=False):
+         self.model_path = model_path
+         self.worker_id = worker_id
+         self.device = device
+@@ -163,10 +173,12 @@ class ModelWorker:
+             device=device,
+         )
+         self.pipeline.enable_flashvdm(mc_algo='mc')
+-        # self.pipeline_t2i = HunyuanDiTPipeline(
+-        #     'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
+-        #     device=device
+-        # )
++        self.pipeline_t2i = None
++        if enable_t23d:
++            self.pipeline_t2i = HunyuanDiTPipeline(
++                'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
++                device=device
++            )
+         if enable_tex:
+             self.pipeline_tex = Hunyuan3DPaintPipeline.from_pretrained(tex_model_path)
+ 
+@@ -190,6 +202,8 @@ class ModelWorker:
+             image = load_image_from_base64(image)
+         else:
+             if 'text' in params:
++                if self.pipeline_t2i is None:
++                    raise ValueError("Text-to-3D is disabled. Restart api_server.py with --enable_t23d to enable it.")
+                 text = params["text"]
+                 image = self.pipeline_t2i(text)
+             else:
+@@ -302,15 +316,18 @@ if __name__ == "__main__":
+     parser.add_argument("--host", type=str, default="0.0.0.0")
+     parser.add_argument("--port", type=int, default=8081)
+     parser.add_argument("--model_path", type=str, default='tencent/Hunyuan3D-2mini')
++    parser.add_argument("--subfolder", type=str, default='hunyuan3d-dit-v2-mini-turbo')
+     parser.add_argument("--tex_model_path", type=str, default='tencent/Hunyuan3D-2')
+     parser.add_argument("--device", type=str, default="cuda")
+     parser.add_argument("--limit-model-concurrency", type=int, default=5)
+     parser.add_argument('--enable_tex', action='store_true')
++    parser.add_argument('--enable_t23d', action='store_true')
+     args = parser.parse_args()
+     logger.info(f"args: {args}")
+ 
+     model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
+ 
+-    worker = ModelWorker(model_path=args.model_path, device=args.device, enable_tex=args.enable_tex,
+-                         tex_model_path=args.tex_model_path)
++    worker = ModelWorker(model_path=args.model_path, subfolder=args.subfolder, device=args.device,
++                         enable_tex=args.enable_tex, tex_model_path=args.tex_model_path,
++                         enable_t23d=args.enable_t23d)
+     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+diff --git a/gradio_app.py b/gradio_app.py
+index 8d81813..14460f4 100755
+--- a/gradio_app.py
++++ b/gradio_app.py
+@@ -19,6 +19,15 @@ import time
+ from glob import glob
+ from pathlib import Path
+ 
++# Must be set before torch loads. Without this, the multiview texture
++# diffusion step can hit "HIP/CUDA out of memory" well before VRAM is
++# actually full - allocator fragmentation, not a real capacity limit. Safe
++# on every backend: PYTORCH_ALLOC_CONF is CUDA's current name,
++# PYTORCH_HIP_ALLOC_CONF is what ROCm torch 2.x still reads; unused ones are
++# no-ops. Verified end-to-end on an AMD Radeon AI PRO R9700 (ROCm 7.2.1).
++os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
++os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
++
+ import gradio as gr
+ import torch
+ import trimesh
+diff --git a/hy3dgen/rembg.py b/hy3dgen/rembg.py
+index 6247f06..14dabf3 100644
+--- a/hy3dgen/rembg.py
++++ b/hy3dgen/rembg.py
+@@ -18,7 +18,11 @@ from rembg import remove, new_session
+ 
+ class BackgroundRemover():
+     def __init__(self):
+-        self.session = new_session()
++        # rembg's own provider auto-detection only checks for
++        # CUDA/ROCM/OpenVINO execution providers, never DirectML - so on
++        # Windows + AMD (no CUDA/ROCm onnxruntime build available there) it
++        # silently falls back to CPU/system RAM unless told otherwise here.
++        self.session = new_session(providers=['DmlExecutionProvider', 'CPUExecutionProvider'])
+ 
+     def __call__(self, image: Image.Image):
+         output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0])
+diff --git a/hy3dgen/texgen/utils/multiview_utils.py b/hy3dgen/texgen/utils/multiview_utils.py
+index 4d6a6ba..8083ab0 100644
+--- a/hy3dgen/texgen/utils/multiview_utils.py
++++ b/hy3dgen/texgen/utils/multiview_utils.py
+@@ -33,7 +33,8 @@ class Multiview_Diffusion_Net():
+ 
+         pipeline = DiffusionPipeline.from_pretrained(
+             multiview_ckpt_path,
+-            custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16)
++            custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16,
++            trust_remote_code=True)
+ 
+         if config.pipe_name in ['hunyuanpaint']:
+             pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config,

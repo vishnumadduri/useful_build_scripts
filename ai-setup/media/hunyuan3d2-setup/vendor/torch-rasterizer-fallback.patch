@@ -1,0 +1,74 @@
+diff --git a/hy3dgen/texgen/differentiable_renderer/mesh_render.py b/hy3dgen/texgen/differentiable_renderer/mesh_render.py
+index 6f83a36..0bdea05 100644
+--- a/hy3dgen/texgen/differentiable_renderer/mesh_render.py
++++ b/hy3dgen/texgen/differentiable_renderer/mesh_render.py
+@@ -142,7 +142,30 @@ class MeshRender():
+ 
+         self.raster_mode = raster_mode
+         if self.raster_mode == 'cr':
+-            import custom_rasterizer as cr
++            try:
++                import custom_rasterizer as cr
++            except ImportError as e:
++                # custom_rasterizer_kernel is a compiled CUDA/HIP extension.
++                # On Windows+ROCm it cannot be built at all (the ROCm torch
++                # wheel can't link any C++ extension, GPU or CPU) -- fall back
++                # to the vendored pure-PyTorch reimplementation, which needs no
++                # compiler and matches the compiled kernel's output exactly
++                # (verified against a literal transcription of its C++ logic).
++                import sys
++                from pathlib import Path
++                vendor_dir = Path(__file__).resolve().parents[1] / 'torch_rasterizer_vendor'
++                sys.path.insert(0, str(vendor_dir))
++                import torch_rasterizer as cr
++                self.raster_mode = 'torch'
++                print(f'[MeshRender] custom_rasterizer unavailable ({e}); '
++                      f'using pure-PyTorch torch_rasterizer fallback')
++            self.raster = cr
++        elif self.raster_mode == 'torch':
++            import sys
++            from pathlib import Path
++            vendor_dir = Path(__file__).resolve().parents[1] / 'torch_rasterizer_vendor'
++            sys.path.insert(0, str(vendor_dir))
++            import torch_rasterizer as cr
+             self.raster = cr
+         else:
+             raise f'No raster named {self.raster_mode}'
+@@ -164,7 +187,7 @@ class MeshRender():
+ 
+     def raster_rasterize(self, pos, tri, resolution, ranges=None, grad_db=True):
+ 
+-        if self.raster_mode == 'cr':
++        if self.raster_mode in ('cr', 'torch'):
+             rast_out_db = None
+             if pos.dim() == 2:
+                 pos = pos.unsqueeze(0)
+@@ -178,7 +201,7 @@ class MeshRender():
+ 
+     def raster_interpolate(self, uv, rast_out, uv_idx, rast_db=None, diff_attrs=None):
+ 
+-        if self.raster_mode == 'cr':
++        if self.raster_mode in ('cr', 'torch'):
+             textd = None
+             barycentric = rast_out[0, ..., :-1]
+             findices = rast_out[0, ..., -1]
+@@ -193,8 +216,8 @@ class MeshRender():
+     def raster_texture(self, tex, uv, uv_da=None, mip_level_bias=None, mip=None, filter_mode='auto',
+                        boundary_mode='wrap', max_mip_level=None):
+ 
+-        if self.raster_mode == 'cr':
+-            raise f'Texture is not implemented in cr'
++        if self.raster_mode in ('cr', 'torch'):
++            raise f'Texture is not implemented in {self.raster_mode}'
+         else:
+             raise f'No raster named {self.raster_mode}'
+ 
+@@ -202,7 +225,7 @@ class MeshRender():
+ 
+     def raster_antialias(self, color, rast, pos, tri, topology_hash=None, pos_gradient_boost=1.0):
+ 
+-        if self.raster_mode == 'cr':
++        if self.raster_mode in ('cr', 'torch'):
+             # Antialias has not been supported yet
+             color = color
+         else:

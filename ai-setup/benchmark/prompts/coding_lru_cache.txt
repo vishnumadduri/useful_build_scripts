@@ -1,0 +1,7 @@
+Implement a thread-safe LRU (Least Recently Used) cache in Python from scratch (no functools.lru_cache, no external libraries). Requirements:
+1. O(1) get and put operations using a doubly linked list + hash map.
+2. Support a `capacity` constructor argument.
+3. Thread-safety via a lock so it is safe under concurrent access from multiple threads.
+4. Include a `__repr__` that shows current contents in MRU-to-LRU order.
+5. Write 5 unit tests (using unittest) covering: basic get/put, eviction order, updating an existing key refreshes recency, capacity=1 edge case, and thread-safety under concurrent puts.
+Provide the full code in a single Python file, with brief comments only where non-obvious.

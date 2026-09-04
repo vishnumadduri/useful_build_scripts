@@ -4,24 +4,28 @@ Script to set up [Tencent Hunyuan3D-2](https://github.com/Tencent-Hunyuan/Hunyua
 (image/text -> 3D mesh + PBR texture generation) on Windows: clones the repo,
 creates an isolated Python venv, installs PyTorch (NVIDIA CUDA, AMD
 ROCm-on-Windows preview, or CPU - auto-detected from the GPU present),
-installs the project's dependencies, best-effort builds the two extensions
-needed for texture generation, and pre-downloads the model weights from
-HuggingFace.
+installs the project's dependencies, best-effort builds the native
+`custom_rasterizer` extension needed for texture generation's fast path,
+always installs a vendored pure-PyTorch fallback for the same rasterizer
+(works on any GPU path, no compiler needed), and pre-downloads the model
+weights from HuggingFace.
 
-**AMD GPUs (e.g. Radeon AI PRO R9700 / RDNA4):** shape generation works via
-AMD's official Windows ROCm preview PyTorch wheels. Texture generation does
-not - `custom_rasterizer` is a raw CUDA extension with no HIP port upstream,
-so it can't build against an AMD GPU. See [AMD/ROCm](#amdrocm-r9700-etc)
-below.
+**AMD GPUs (e.g. Radeon AI PRO R9700 / RDNA4):** both shape AND texture
+generation work, via AMD's official Windows ROCm preview PyTorch wheels plus
+the pure-PyTorch rasterizer fallback (`custom_rasterizer`'s native build
+itself is still CUDA-only with no HIP port upstream - the fallback is what
+makes texture generation possible here at all). Verified end-to-end on a
+Radeon AI PRO R9700, ROCm 7.2.1. See [AMD/ROCm](#amdrocm-r9700-etc) below.
 
 ## Scripts
 
 | Script | Purpose |
 |---|---|
-| `setup_hunyuan3d2_env.ps1` | Clone the repo, set up the venv/PyTorch/deps, build extensions, download weights |
+| `setup_hunyuan3d2_env.ps1` | Clone the repo, set up the venv/PyTorch/deps, build/vendor texture-gen extensions, download weights |
 | `setup_hunyuan3d2_env.bat` | Double-clickable wrapper that runs the .ps1 with the execution policy bypassed |
 | `setup_hunyuan3d2_env_amd.bat` | Same, but forces `-GpuVendor Amd` - no arguments needed for AMD GPUs |
-| `windows-fixes.patch` | Two small upstream bug fixes applied automatically after cloning - see [Windows fixes patch](#windows-fixes-patch) |
+| `windows-fixes.patch` | Three small upstream bug fixes applied automatically after cloning - see [Windows fixes patch](#windows-fixes-patch) |
+| `vendor/torch_rasterizer.py`, `vendor/torch-rasterizer-fallback.patch` | Pure-PyTorch `custom_rasterizer` fallback, installed on every GPU path - see [Texture generation on any GPU](#texture-generation-on-any-gpu) |
 
 ---
 
@@ -62,7 +66,8 @@ UAC):
 | `-SkipVenv` | off | Skip creating the venv |
 | `-SkipTorchInstall` | off | Skip installing PyTorch |
 | `-SkipRequirements` | off | Skip `pip install -r requirements.txt` / `pip install -e .` |
-| `-SkipCustomRasterizerBuild` | off | Skip building the texture-generation extensions |
+| `-SkipCustomRasterizerBuild` | off | Skip building the native `custom_rasterizer` extension (NVIDIA-only fast path) |
+| `-SkipTorchRasterizerFallback` | off | Skip installing the pure-PyTorch `custom_rasterizer` fallback - see [Texture generation on any GPU](#texture-generation-on-any-gpu) |
 | `-SkipModelDownload` | off | Skip pre-downloading model weights |
 
 ### What it does
@@ -93,16 +98,19 @@ UAC):
      removal, used by every generation) runs on the GPU via DirectML instead
      of system RAM. Paired with the `DmlExecutionProvider` change in
      `windows-fixes.patch`.
-8. **Best-effort** builds `custom_rasterizer` and `differentiable_renderer`
-   (`hy3dgen/texgen/*`), the CUDA-only C++ extensions texture generation
-   needs. On the **NVIDIA** path this requires `cl.exe` (MSVC) and `nvcc`
-   (CUDA Toolkit matching the installed PyTorch build) on `PATH` - the script
-   detects both first and **skips the build with instructions instead of
-   silently installing multi-GB toolkits** if either is missing. On the
-   **AMD** path the build is **always skipped** - these extensions have no
-   HIP/ROCm port upstream, so they cannot build against an AMD GPU regardless
-   of what's installed. Shape generation works fine on both paths without them.
-9. Pre-downloads the selected model repo's weights via
+8. **Best-effort** builds `custom_rasterizer` (`hy3dgen/texgen/*`), the
+   CUDA-only C++ extension texture generation's native path needs. On the
+   **NVIDIA** path this requires `cl.exe` (MSVC) and `nvcc` (CUDA Toolkit
+   matching the installed PyTorch build) on `PATH` - the script detects both
+   first and **skips the build with instructions instead of silently
+   installing multi-GB toolkits** if either is missing. On the **AMD** path
+   the build is **always skipped** - this extension has no HIP/ROCm port
+   upstream, so it cannot build against an AMD GPU regardless of what's
+   installed. Shape generation works fine on every path without it.
+9. Installs the **pure-PyTorch `custom_rasterizer` fallback** - see
+   [Texture generation on any GPU](#texture-generation-on-any-gpu) - on
+   every GPU path, always (skip with `-SkipTorchRasterizerFallback`).
+10. Pre-downloads the selected model repo's weights via
    `huggingface_hub.snapshot_download`, so the first `from_pretrained(...)`
    call in your own code doesn't block on a multi-GB download. Caches to
    `%USERPROFILE%\.cache\huggingface` by default, or `-ModelCacheDir` if set.
@@ -129,10 +137,11 @@ that step manually and re-run with the earlier steps skipped.
 
 ### Windows fixes patch
 
-`windows-fixes.patch` fixes two bugs found running this project on Windows
-(not AMD-specific - both apply on NVIDIA too). Applied automatically after
-cloning (step 3 above); pass `-SkipWindowsPatch` to skip it, or apply/inspect
-it by hand:
+`windows-fixes.patch` fixes five bugs found running this project (not
+actually Windows- or AMD-specific despite the name - all five apply on any
+platform/GPU vendor; kept the legacy name from when it was three).  Applied
+automatically after cloning (step 3 above); pass `-SkipWindowsPatch` to skip
+it, or apply/inspect it by hand:
 ```powershell
 cd "<InstallDir>"
 git apply "<path to>\windows-fixes.patch"
@@ -158,6 +167,47 @@ git apply "<path to>\windows-fixes.patch"
    memory for requested buffer`. The patch makes it explicitly request
    `DmlExecutionProvider` (DirectML - works on any DX12 GPU: NVIDIA/AMD/Intel),
    paired with the setup script swapping in `onnxruntime-directml` (step 7).
+3. **`api_server.py` crashes on text-only requests** (no `image` in the
+   request body - what `blender-mcp`'s "generate from text prompt" tool
+   sends) with `AttributeError: 'ModelWorker' object has no attribute
+   'pipeline_t2i'`. Upstream's `ModelWorker.__init__` has the
+   text-to-image pipeline construction commented out, but `generate()`
+   still calls `self.pipeline_t2i(text)` unconditionally on the text-only
+   path - it's dead code no CLI flag ever turns on, unlike `gradio_app.py`
+   which already gates the same pipeline behind `--enable_t23d`. The patch
+   adds a matching `--enable_t23d` flag to `api_server.py` (uncommenting the
+   `HunyuanDiTPipeline` construction when passed) and turns the missing-pipeline
+   case into a clean `ValueError` ("Text-to-3D is disabled...") instead of an
+   `AttributeError`, so image-only requests keep working unmodified and
+   text-only requests fail with a clear message instead of a 404/traceback
+   when the flag is omitted:
+   ```powershell
+   .\venv\Scripts\python.exe api_server.py --model_path tencent/Hunyuan3D-2 --subfolder hunyuan3d-dit-v2-0 --device cuda --enable_t23d
+   ```
+   Same `sentencepiece` requirement and ~14.5 GB first-use download as
+   `gradio_app.py --enable_t23d` (see [Gradio web demo](#3-gradio-web-demo)
+   below) - both load the same `hy3dgen/text2image.py` pipeline.
+4. **Texture generation can OOM well before VRAM is actually full**, from
+   plain PyTorch allocator fragmentation rather than a real capacity limit -
+   reproduced reliably on an AMD Radeon AI PRO R9700 (32 GiB VRAM): the
+   multiview texture diffusion step failed with `torch.OutOfMemoryError: HIP
+   out of memory` at ~30/32 GiB used, with the error message itself
+   suggesting the fix. The patch sets
+   `PYTORCH_ALLOC_CONF`/`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` at
+   the very top of `gradio_app.py` and `api_server.py` (before `torch`
+   loads, since it must be set before the allocator initializes). Harmless
+   on NVIDIA too - `PYTORCH_ALLOC_CONF` is the current CUDA-side name,
+   `PYTORCH_HIP_ALLOC_CONF` is the ROCm-specific one PyTorch 2.x still
+   reads; an unused one is just a no-op.
+5. **`hy3dgen/texgen/utils/multiview_utils.py` fails to load the paint
+   pipeline** with `ValueError: The directory ...\hunyuanpaint contains
+   custom code in pipeline.py which must be executed to correctly load the
+   model. ... Pass trust_remote_code=True`. Newer `diffusers` versions gate
+   *any* `custom_pipeline=` path behind `trust_remote_code=True`, even a
+   purely local one bundled with this repo (not fetched from the Hub) -
+   which is exactly what this is, so passing it is safe. Without this fix,
+   texture generation never gets past loading the multiview diffusion
+   model, on any GPU vendor.
 
 The patch is idempotent - re-running the setup script detects if it's
 already applied (via `git apply --reverse --check`) and skips cleanly rather
@@ -165,15 +215,57 @@ than erroring. If upstream changes these files enough that the patch stops
 applying, the script warns and continues rather than failing the whole run;
 apply the equivalent change by hand in that case.
 
+### Texture generation on any GPU
+
+`custom_rasterizer` (the UV rasterization/baking step inside
+`hy3dgen/texgen/differentiable_renderer/mesh_render.py`) is a compiled
+CUDA/HIP C++ extension - on Windows it only has precompiled/buildable paths
+for NVIDIA (`cl.exe` + `nvcc`), never AMD (no HIP port upstream exists).
+
+To make texture generation work everywhere regardless, this script vendors
+`vendor/torch_rasterizer.py` - a pure-PyTorch reimplementation of the same
+`rasterize`/`interpolate` functions, verified against a literal
+transcription of the native kernel's C++ logic - and applies
+`vendor/torch-rasterizer-fallback.patch`, which teaches `mesh_render.py` to
+fall back to it automatically whenever `import custom_rasterizer` fails,
+instead of the pipeline erroring out or (on the AMD path in `gradio_app.py`)
+silently disabling the texture UI. It needs no compiler or toolchain on any
+platform and runs on whatever device the tensors are on (CUDA, ROCm, MPS,
+CPU), so it also covers CPU-only setups and machines where the NVIDIA wheel
+doesn't quite match the installed torch/CUDA build.
+
+This is installed unconditionally (step 9 above, `-SkipTorchRasterizerFallback`
+to opt out) and is purely additive on NVIDIA: `mesh_render.py` always tries
+the native extension first and only falls back on `ImportError`, so having
+both installed is never a downgrade there - only a safety net. On AMD/ROCm
+or CPU, it's the only path, and is correspondingly slower than a native CUDA
+build. The patch itself is idempotent (same convention as
+`windows-fixes.patch` - `git apply --reverse --check` detects if it's
+already applied and skips cleanly) and warns instead of failing if upstream
+changes `mesh_render.py` enough that it no longer applies.
+
+Verified end-to-end on an AMD Radeon AI PRO R9700 (ROCm 7.2.1) two ways:
+constructing `MeshRender` and rasterizing a real triangle produces correct
+pixel coverage on the ROCm device (`cuda:0`) with zero compiled extensions
+present, and a full real run of `minimal_demo.py`'s pipeline (shape
+generation -> mesh postprocessing -> delight -> multiview diffusion -> UV
+bake via this fallback -> export) completed successfully end-to-end,
+producing an actual textured `.glb` (shape mesh reduced 730K -> 40K faces
+via `FaceReducer`, texture generation ~500s). That full run is what surfaced
+fixes 4 and 5 in [Windows fixes patch](#windows-fixes-patch) above - without
+them, texture generation doesn't get far enough to exercise this rasterizer
+fallback at all.
+
 ### AMD/ROCm (R9700, etc.)
 
 Shape generation works on AMD via
 [AMD's official Windows ROCm preview PyTorch wheels](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/windows/install-pytorch.html)
 (currently PyTorch 2.9.1 + ROCm 7.2.1, supporting RDNA4/gfx1201 cards like the
-Radeon AI PRO R9700). **Texture generation does not work** - `custom_rasterizer`
-is a raw CUDA extension (`nvcc`, `.cu` kernels) with no HIP port upstream, so
-it cannot be built against an AMD GPU no matter what's installed; the script
-skips that build step unconditionally on this path.
+Radeon AI PRO R9700). **Texture generation works too**, via the pure-PyTorch
+fallback described above - `custom_rasterizer`'s native build is still
+CUDA-only (`nvcc`, `.cu` kernels) with no HIP port upstream, so the script
+still skips that build step unconditionally on this path, but no longer
+needs to for texture generation to work.
 
 Prerequisites this script does **not** install for you:
 - The **26.2.2+ Adrenalin driver** (GPU driver updates aren't scripted here -
@@ -192,13 +284,18 @@ Verify PyTorch sees the GPU after setup:
 
 ### Manual steps / notes
 
-- **Texture generation build failures on NVIDIA/Windows** are the most common
-  friction point with this project - `custom_rasterizer` is a CUDA extension
-  and needs an exact MSVC + CUDA Toolkit setup. If the automated build keeps
-  failing after installing both, the community-maintained
+- **Texture generation build failures on NVIDIA/Windows** used to be the most
+  common friction point with this project - `custom_rasterizer` is a CUDA
+  extension and needs an exact MSVC + CUDA Toolkit setup to build natively.
+  That's no longer a blocker: this script always installs the pure-PyTorch
+  fallback (see [Texture generation on any GPU](#texture-generation-on-any-gpu))
+  regardless of whether the native build succeeds, so texture generation
+  works either way - MSVC + CUDA Toolkit are only worth installing now if you
+  want the faster native path specifically, not to unblock texture generation
+  itself. If you'd still rather avoid the compile step entirely for some
+  other reason, the community-maintained
   [Hunyuan3D-2-WinPortable](https://github.com/YanWenKun/Hunyuan3D-2-WinPortable)
-  bundle avoids the compile step entirely and is what the upstream README
-  itself points Windows users to.
+  bundle is what the upstream README points Windows users to.
 - **License** - review Hunyuan3D-2's own `LICENSE`/`NOTICE` in the cloned
   repo before any commercial use; Tencent ships it under a community license,
   not a permissive OSS one.
@@ -305,25 +402,28 @@ downloaded model repo's snapshot (e.g.
 - it's specific to which `-ModelRepo` you downloaded, not interchangeable.
 For the default `tencent/Hunyuan3D-2` repo it's `hunyuan3d-dit-v2-0`.
 
-**NVIDIA (with the texture-generation extensions built):**
+**Any GPU path, shape + texture** (NVIDIA uses the native `custom_rasterizer`
+build if present, falls back to the pure-PyTorch rasterizer otherwise - AMD
+always uses the fallback, see [Texture generation on any GPU](#texture-generation-on-any-gpu)):
 ```powershell
 cd "<InstallDir>"
+$env:HF_HOME = "<ModelCacheDir>"   # only if you passed -ModelCacheDir during setup
 & "<InstallDir>\venv\Scripts\python.exe" gradio_app.py --model_path <ModelRepo> --subfolder hunyuan3d-dit-v2-0 --texgen_model_path <ModelRepo> --low_vram_mode
 ```
 
-**AMD/ROCm (shape only - skip loading the texture pipeline entirely):**
+**Shape only** (skip loading the texture pipeline entirely - faster startup,
+lower VRAM, if you don't need texture generation for a given run):
 ```powershell
 cd "<InstallDir>"
 $env:HF_HOME = "<ModelCacheDir>"   # only if you passed -ModelCacheDir during setup
 & "<InstallDir>\venv\Scripts\python.exe" gradio_app.py --model_path <ModelRepo> --subfolder hunyuan3d-dit-v2-0 --disable_tex
 ```
 
-**AMD/ROCm, with Text-to-3D also enabled** (confirmed working - shape and
-text-to-3D both run fine on ROCm, only texture generation doesn't):
+**With Text-to-3D also enabled:**
 ```powershell
 cd "<InstallDir>"
 $env:HF_HOME = "<ModelCacheDir>"   # only if you passed -ModelCacheDir during setup
-& "<InstallDir>\venv\Scripts\python.exe" gradio_app.py --model_path <ModelRepo> --subfolder hunyuan3d-dit-v2-0 --disable_tex --enable_t23d
+& "<InstallDir>\venv\Scripts\python.exe" gradio_app.py --model_path <ModelRepo> --subfolder hunyuan3d-dit-v2-0 --texgen_model_path <ModelRepo> --enable_t23d
 ```
 
 Either way, it binds to `0.0.0.0:8080` by default (confirmed working) - open
@@ -347,9 +447,18 @@ unrelated to GPU vendor - happens on NVIDIA too.
 
 ### On the AMD/ROCm path
 
-Shape generation and text-to-3D (`--enable_t23d`) both work fine - only
-**texture generation** doesn't (see [AMD/ROCm](#amdrocm-r9700-etc) above),
-since `custom_rasterizer` was never built. Pass `--disable_tex` as shown
-above to skip the texture pipeline cleanly; without it, `gradio_app.py`
-still starts (the texgen import failure is caught) but prints a "Failed to
-load texture generator" warning and disables the texture UI automatically.
+Shape generation, texture generation, and text-to-3D (`--enable_t23d`) all
+work (see [Texture generation on any GPU](#texture-generation-on-any-gpu)
+above) - texture generation runs via the pure-PyTorch rasterizer fallback
+since `custom_rasterizer`'s native build is never attempted on this path.
+Pass `--disable_tex` only if you specifically want to skip the texture
+pipeline for a faster/lower-VRAM run, not because it doesn't work.
+
+
+# powershell.exe -NoProfile -Command "`$env:HF_HOME = 'D:\AI\Hunyuan3D-2\hf-cache'; & 'D:\AI\Hunyuan3D-2\venv\Scripts\python.exe' 'D:\AI\Hunyuan3D-2\api_server.py' --model_path tencent/Hunyuan3D-2 --subfolder hunyuan3d-dit-v2-0 --device cuda --enable_t23d" *> $logPath
+
+
+powershell.exe -NoProfile -Command "`$env:HF_HOME = 'D:\AI\Hunyuan3D-2\hf-cache'; & 'D:\AI\Hunyuan3D-2\venv\Scripts\python.exe' 'D:\AI\Hunyuan3D-2\api_server.py' --model_path tencent/Hunyuan3D-2 --subfolder hunyuan3d-dit-v2-0 --device cuda --enable_t23d" *> $logPath 
+
+
+gradio_app.py --model_path <ModelRepo> --subfolder hunyuan3d-dit-v2-0 --disable_tex

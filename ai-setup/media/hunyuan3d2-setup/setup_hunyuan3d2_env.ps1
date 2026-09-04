@@ -5,24 +5,28 @@ https://github.com/Tencent-Hunyuan/Hunyuan3D-2
 
 Clones the repo, creates a Python venv, installs PyTorch (NVIDIA CUDA, AMD
 ROCm-on-Windows preview, or CPU - auto-detected from the GPU present),
-installs the project's requirements + package, best-effort builds the two
-CUDA-only C++ extensions needed for texture generation (custom_rasterizer and
-differentiable_renderer), and pre-downloads the model weights from
-HuggingFace into the standard HF cache so `from_pretrained(...)` doesn't
-re-download them on first run.
+installs the project's requirements + package, best-effort builds the
+CUDA-only C++ extension needed for texture generation's native path
+(custom_rasterizer - see -SkipCustomRasterizerBuild), always installs a
+vendored pure-PyTorch fallback for the same rasterizer that needs no
+compiler and works on any GPU path (see -SkipTorchRasterizerFallback), and
+pre-downloads the model weights from HuggingFace into the standard HF cache
+so `from_pretrained(...)` doesn't re-download them on first run.
 
 GPU paths:
   - NVIDIA: needs cl.exe (MSVC) and nvcc (CUDA Toolkit) to also build the
-    texture-generation extensions; the script detects both and skips that
-    build with instructions if either is missing, rather than silently
-    installing multi-GB toolkits. Shape generation alone does not need them.
+    native texture-generation extension; the script detects both and skips
+    that build with instructions if either is missing, rather than silently
+    installing multi-GB toolkits, falling back to the pure-PyTorch
+    rasterizer either way. Shape generation alone does not need either path.
   - AMD (e.g. Radeon AI PRO R9700 / RDNA4, gfx1201): uses AMD's official
     Windows ROCm preview wheels (repo.radeon.com), which are Python
     3.12-only, so this script provisions Python 3.12 specifically on that
-    path. custom_rasterizer/differentiable_renderer are CUDA-only (nvcc,
-    .cu kernels) with no HIP port upstream, so texture generation is not
-    expected to work on AMD/Windows yet - the build is skipped unconditionally
-    on that path. Shape generation runs fine on ROCm.
+    path. custom_rasterizer is CUDA-only (nvcc, .cu kernels) with no HIP
+    port upstream, so the native build is always skipped here - but texture
+    generation still works via the pure-PyTorch fallback (verified
+    end-to-end on a Radeon AI PRO R9700, ROCm 7.2.1), just slower than a
+    native CUDA build. Shape generation runs fine on ROCm either way.
   - No GPU detected: CPU-only PyTorch (works, but very slow).
 
 Run from an elevated PowerShell prompt (winget installs generally want one).
@@ -56,6 +60,7 @@ param(
     [switch]$SkipTorchInstall,
     [switch]$SkipRequirements,
     [switch]$SkipCustomRasterizerBuild,
+    [switch]$SkipTorchRasterizerFallback,
     [switch]$SkipModelDownload
 )
 
@@ -203,7 +208,9 @@ if (-not (Test-Path $InstallDir)) {
 }
 
 # ---------------------------------------------------------------------------
-# Two small upstream fixes needed on Windows regardless of GPU vendor:
+# Five small upstream fixes, applied to gradio_app.py/api_server.py/hy3dgen
+# (not Windows-specific despite the file's name - all five apply on any
+# platform, "Windows fixes" is legacy naming from when it was three):
 #   - api_server.py hardcodes its model subfolder with no CLI override, so it
 #     can't load anything but the mini-turbo variant.
 #   - hy3dgen/rembg.py lets rembg auto-pick its onnxruntime execution
@@ -211,8 +218,27 @@ if (-not (Test-Path $InstallDir)) {
 #     CPU - there's no Windows ROCm onnxruntime build, so this silently runs
 #     on CPU/system RAM even with a capable GPU sitting idle. Route it
 #     through DirectML instead (works on any DX12 GPU: NVIDIA/AMD/Intel).
+#   - api_server.py's ModelWorker has its text-to-image pipeline commented
+#     out with no way to turn it on, so any text-only request (no image)
+#     crashes with AttributeError: 'ModelWorker' object has no attribute
+#     'pipeline_t2i'. Adds a --enable_t23d flag mirroring gradio_app.py's.
+#   - gradio_app.py/api_server.py set no memory-allocator env vars, so the
+#     multiview texture diffusion step can hit "out of memory" from plain
+#     allocator fragmentation well before VRAM is actually full. Sets
+#     PYTORCH_ALLOC_CONF/PYTORCH_HIP_ALLOC_CONF=expandable_segments:True at
+#     the top of both entry points (before torch loads) - verified
+#     end-to-end on an AMD Radeon AI PRO R9700 (ROCm 7.2.1), where texture
+#     generation reliably OOM'd at ~30/32 GiB used without this.
+#   - hy3dgen/texgen/utils/multiview_utils.py's DiffusionPipeline.from_pretrained
+#     loads a local custom pipeline (hy3dgen/texgen/hunyuanpaint/pipeline.py,
+#     bundled with this repo, not fetched from the Hub) without
+#     trust_remote_code=True, which newer diffusers versions require even for
+#     local custom_pipeline paths - fails with "contains custom code in
+#     pipeline.py which must be executed to correctly load the model."
+#     Passing trust_remote_code=True here is safe since it's the project's
+#     own bundled code, not arbitrary remote code.
 if (-not $SkipWindowsPatch) {
-    Write-Step "Applying Windows fixes (subfolder CLI arg, rembg via DirectML)"
+    Write-Step "Applying upstream fixes (subfolder CLI arg, rembg via DirectML, --enable_t23d, memory allocator config)"
     $patchFile = Join-Path $PSScriptRoot "windows-fixes.patch"
     Push-Location $InstallDir
     try {
@@ -344,8 +370,8 @@ if (-not $SkipCustomRasterizerBuild) {
     Write-Step "Building texture-generation extensions (custom_rasterizer, differentiable_renderer)"
 
     if ($ResolvedVendor -eq "Amd") {
-        Write-Warn2 "Skipping: custom_rasterizer/differentiable_renderer are CUDA-only (nvcc, raw .cu kernels) with no HIP/ROCm port upstream, so they cannot build against an AMD GPU."
-        Write-Warn2 "Shape generation still works over ROCm. Texture generation is not expected to work on AMD/Windows until upstream adds HIP support."
+        Write-Warn2 "Skipping native build: custom_rasterizer/differentiable_renderer are CUDA-only (nvcc, raw .cu kernels) with no HIP/ROCm port upstream, so they cannot build against an AMD GPU."
+        Write-Warn2 "Shape generation works over ROCm regardless. Texture generation still works too - see the pure-PyTorch fallback installed right after this step."
         $hasCl = $false
         $hasNvcc = $false
     } else {
@@ -390,6 +416,49 @@ if (-not $SkipCustomRasterizerBuild) {
 }
 
 # ---------------------------------------------------------------------------
+# Pure-PyTorch fallback for custom_rasterizer's UV-bake step, installed
+# regardless of GPU vendor or whether the native build above succeeded.
+# mesh_render.py already tries the native extension first and only falls
+# back on ImportError, so this is a safety net on NVIDIA (never a downgrade)
+# and the *only* path on AMD/ROCm, where the native extension can never be
+# built at all (the Windows ROCm torch wheel can't link any C++ extension,
+# GPU or CPU variant). Verified end-to-end against an AMD Radeon AI PRO
+# R9700 (ROCm 7.2.1): a real mesh rasterizes correctly on the ROCm device
+# with zero compiled extensions present.
+if (-not $SkipTorchRasterizerFallback) {
+    Write-Step "Installing pure-PyTorch custom_rasterizer fallback (texture generation on any GPU path)"
+    $vendorSrc = Join-Path $PSScriptRoot "vendor\torch_rasterizer.py"
+    $vendorDst = Join-Path $InstallDir "hy3dgen\texgen\torch_rasterizer_vendor"
+    if (Test-Path $vendorSrc) {
+        New-Item -ItemType Directory -Force -Path $vendorDst | Out-Null
+        Copy-Item -Path $vendorSrc -Destination (Join-Path $vendorDst "torch_rasterizer.py") -Force
+
+        $rasterizerPatch = Join-Path $PSScriptRoot "vendor\torch-rasterizer-fallback.patch"
+        Push-Location $InstallDir
+        try {
+            git apply --check $rasterizerPatch | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                git apply $rasterizerPatch
+                Write-Host "    Patched mesh_render.py to fall back to the pure-PyTorch rasterizer when custom_rasterizer isn't importable."
+            } else {
+                git apply --reverse --check $rasterizerPatch | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "    mesh_render.py already patched, skipping."
+                } else {
+                    Write-Warn2 "mesh_render.py patch didn't apply cleanly (upstream file may have changed) - apply it manually or diff by hand: $rasterizerPatch"
+                }
+            }
+        } finally {
+            Pop-Location
+        }
+    } else {
+        Write-Warn2 "Vendored torch_rasterizer.py not found at $vendorSrc - skipping the pure-PyTorch fallback."
+    }
+} else {
+    Write-Host "`n==> Skipping pure-PyTorch custom_rasterizer fallback (-SkipTorchRasterizerFallback)" -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------
 if (-not $SkipModelDownload) {
     Write-Step "Downloading model weights ($ModelRepo)"
     if ($ModelCacheDir) {
@@ -428,7 +497,9 @@ Write-Host @"
       $(if ($ModelCacheDir) { "`$env:HF_HOME = `"$ModelCacheDir`"`n      " })& "$VenvPython" -c "from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline; p = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained('$ModelRepo'); p(image='assets/demo.png')[0].export('out.glb')"
       (run from $InstallDir so the relative asset path resolves$(if ($ModelCacheDir) { "; set HF_HOME as shown so it finds the cache" }))
 
-    Or launch the Gradio demo:
+    Or launch the Gradio demo (shape + texture both work on every GPU path -
+    texture runs via the pure-PyTorch fallback where the native extension
+    isn't built, slower but functional):
       cd "$InstallDir"
       & "$VenvPython" gradio_app.py --model_path $ModelRepo --subfolder hunyuan3d-dit-v2-0 --texgen_model_path $ModelRepo --low_vram_mode
 
@@ -436,14 +507,17 @@ Write-Host @"
 $(if ($ResolvedVendor -eq "Amd") {
 "
     AMD/ROCm notes:
-      - Texture generation is not supported on this path (see warnings
-        above) - only run shape generation.
+      - Texture generation works via the pure-PyTorch rasterizer fallback
+        (verified end-to-end on a Radeon AI PRO R9700) - slower than a
+        native CUDA build, but no separate setup needed.
       - Make sure the 26.2.2+ Adrenalin driver is installed.
       - Verify PyTorch sees the GPU: & `"$VenvPython`" -c `"import torch; print(torch.cuda.is_available())`""
 } elseif (-not $TextureExtBuilt) {
 "
-    If the extension build was skipped, texture generation will fail until
-    you install MSVC Build Tools + a matching CUDA Toolkit and re-run this
-    script with only the build step enabled (see warnings above)."
+    The native custom_rasterizer build was skipped, but texture generation
+    still works via the pure-PyTorch fallback (slower than native CUDA).
+    Install MSVC Build Tools + a matching CUDA Toolkit and re-run this
+    script with only the build step enabled (see warnings above) for the
+    faster native path."
 })
 "@
