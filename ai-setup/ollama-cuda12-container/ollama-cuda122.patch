@@ -1,0 +1,75 @@
+diff --git a/Dockerfile b/Dockerfile
+index 9ebd6b4..0000000 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -17,4 +17,5 @@ FROM scratch AS local-mlx-c
+-FROM --platform=linux/amd64 rocm/dev-almalinux-8:${ROCMVERSION}-complete AS base-amd64
+-RUN dnf install -y yum-utils ccache gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ gcc-toolset-13-binutils \
+-    && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+-ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
++FROM --platform=linux/amd64 nvidia/cuda:12.2.2-devel-ubuntu22.04 AS base-amd64
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends ca-certificates ccache curl g++ gcc git unzip \
++    && rm -rf /var/lib/apt/lists/*
++ENV PATH=/usr/local/cuda-12.2/bin:$PATH
+@@ -33,5 +34,4 @@ RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKEVERSION}
+-RUN dnf install -y unzip \
+-    && curl -fsSL -o /tmp/ninja.zip https://github.com/ninja-build/ninja/releases/download/v${NINJAVERSION}/ninja-linux$([ "$(uname -m)" = "aarch64" ] && echo "-aarch64").zip \
++RUN curl -fsSL -o /tmp/ninja.zip https://github.com/ninja-build/ninja/releases/download/v${NINJAVERSION}/ninja-linux$([ "$(uname -m)" = "aarch64" ] && echo "-aarch64").zip \
+     && unzip /tmp/ninja.zip -d /usr/local/bin \
+     && rm /tmp/ninja.zip
+ ENV CMAKE_GENERATOR=Ninja
+@@ -44,8 +44,6 @@ ENV LDFLAGS=-s
+ FROM base AS cpu-deps
+-RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++
+-ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
+-
++# CPU toolchain used by the mandatory CPU runner.
+ FROM base AS cuda-12-deps
+-ARG CUDA12VERSION=12.8
+-RUN dnf install -y cuda-toolkit-${CUDA12VERSION//./-}
+-ENV PATH=/usr/local/cuda-12/bin:$PATH
++ARG CUDA12VERSION=12.2
++ARG CUDA_ARCHITECTURES="61;70;75;80;86;89;90"
++# CUDA 12.2 toolkit is inherited from base-amd64.
+@@ -104,8 +102,9 @@ FROM cuda-12-deps AS llama-server-cuda_v12
+ COPY LLAMA_CPP_VERSION .
+ COPY llama/server llama/server
+ COPY llama/compat llama/compat
+ COPY cmake cmake
+ RUN --mount=type=cache,target=/root/.ccache \
+-    cmake -S llama/server --preset llama_cuda_v12_linux \
++    cmake -S llama/server --preset llama_cuda_v12_linux \
++        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+         && cmake --build build/llama-server-cuda_v12 -- -l $(nproc) \
+         && cmake --install build/llama-server-cuda_v12 --component llama-server --strip
+@@ -333,3 +332,29 @@ ENV OLLAMA_HOST=0.0.0.0:11434
+ EXPOSE 11434
+ ENTRYPOINT ["/bin/ollama"]
+ CMD ["serve"]
++
++# This target's dependency graph contains only the CPU and CUDA 12.2 stages.
++FROM --platform=linux/amd64 scratch AS cuda12-only
++COPY --from=llama-server-cpu      dist/lib/ollama /lib/ollama/
++COPY --from=llama-server-cuda_v12 dist/lib/ollama /lib/ollama/
++
++FROM ubuntu:24.04 AS cuda12-image
++ARG APT_MIRROR=http://archive.ubuntu.com/ubuntu
++RUN sed -i -e "s|http://archive.ubuntu.com/ubuntu|$APT_MIRROR|g" /etc/apt/sources.list.d/ubuntu.sources \
++    && apt-get update \
++    && apt-get install -y --no-install-recommends ca-certificates \
++    && apt-get clean \
++    && rm -rf /var/lib/apt/lists/*
++
++COPY --from=build /bin/ollama /usr/bin/ollama
++COPY --from=build /go/src/github.com/ollama/ollama/build/go-license/lib/ollama/GO_LICENSE /usr/lib/ollama/GO_LICENSE
++COPY --from=cuda12-only /lib/ollama /usr/lib/ollama
++
++ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
++ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
++ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
++ENV NVIDIA_VISIBLE_DEVICES=all
++ENV OLLAMA_HOST=0.0.0.0:11434
++EXPOSE 11434
++ENTRYPOINT ["/usr/bin/ollama"]
++CMD ["serve"]
