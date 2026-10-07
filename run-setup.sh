@@ -16,6 +16,7 @@ Targets:
   zephyr-lvgl  Set up and build a Zephyr + LVGL demo for Renode
   ros2         Install a ROS 2 development environment
   unsloth-amd  Install Unsloth Core for AMD on Linux/WSL
+  unsloth      Install Unsloth Studio on Ubuntu/Linux (NVIDIA/AMD/CPU)
 
 Use `--dry-run` to print the command without running it. Target arguments are
 forwarded unchanged; `--` is optional but recommended when the first target
@@ -31,6 +32,7 @@ Documentation:
   renode / zephyr-lvgl  renode/README.md
   ros2                  robotics/ros2-setup/README.md
   unsloth-amd           ai-setup/unsloth-setup/README.md
+  unsloth               ai-setup/unsloth-setup/README.md
 EOF
 }
 
@@ -58,6 +60,7 @@ case "$target_name" in
   zephyr-lvgl) target="renode/setup_zephyr_lvgl.sh" ;;
   ros2) target="robotics/ros2-setup/setup_ros2_env.sh" ;;
   unsloth-amd) target="ai-setup/unsloth-setup/install_unsloth_amd.sh" ;;
+  unsloth) target="ai-setup/unsloth-setup/install_unsloth_linux.sh" ;;
   *)
     printf 'Unknown target: %s\n\n' "$target_name" >&2
     usage >&2

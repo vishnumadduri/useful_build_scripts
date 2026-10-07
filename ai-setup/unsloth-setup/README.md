@@ -1,4 +1,4 @@
-# Unsloth Windows / AMD installers
+# Unsloth Windows / Linux / AMD installers
 
 Unsloth has two different products/install paths:
 
@@ -66,3 +66,24 @@ ROCm version reported by `amd-smi version`:
 The script downloads and executes the official installer from
 `https://unsloth.ai/install.ps1`; review that script before running it if your
 environment requires downloaded installers to be audited first.
+
+## Ubuntu / Linux (Unsloth Studio)
+
+`install_unsloth_linux.sh` is the Linux counterpart of the Windows Studio
+installer. It installs apt prerequisites, runs Unsloth's official installer
+(`https://unsloth.ai/install.sh`, which detects NVIDIA/AMD GPUs) and creates
+`start.sh`. Defaults to `~/UnslothStudio`; do not run it as root.
+
+```bash
+./install_unsloth_linux.sh
+./install_unsloth_linux.sh --install-dir /data/UnslothStudio --model-cache-dir /data/hf --skip-autostart
+./install_unsloth_linux.sh --action update
+```
+
+Or from the repository root: `./run-setup.sh unsloth -- --skip-autostart`.
+
+Launch with `~/UnslothStudio/start.sh` (port 8888). It sets `UNSLOTH_STUDIO_HOME`,
+`HF_HOME` and `HF_HUB_CACHE` for that run only; nothing is written to your
+shell profile. Review the downloaded installer first if your environment
+requires auditing. For AMD *training* with Unsloth Core on Linux, use
+`install_unsloth_amd.sh` (note it defaults to a WSL `/mnt/` path).
